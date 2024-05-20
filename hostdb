@@ -1,0 +1,155 @@
+#!/usr/bin/env ruby
+
+require 'mongo'
+require 'optparse'
+require 'resolv'
+
+def mac_address?(s)
+  /\A(?:[[:xdigit:]]{2}:){5}[[:xdigit:]]{2}\Z/.match(s)
+end
+
+def max_length(documents)
+  name = documents.map { |document| document[:Name].length }
+  name.max
+end
+
+def max_size(documents)
+  mac  = documents.map { |document| document[:MAC].nil? ? 0 : document[:MAC].size }
+  ipv6 = documents.map { |document| document[:IPv6].nil? ? 0 : document[:IPv6].size }
+  ipv4 = documents.map { |document| document[:IPv4].nil? ? 0 : document[:IPv4].size }
+
+  { MAC: mac.max, IPv6: ipv6.max, IPv4: ipv4.max }
+end
+
+def print_documents(documents)
+  length = max_length(documents)
+  sizes  = max_size(documents)
+
+  documents.each do |document|
+    format  = format('%%-%ds', length)
+    message = format(format, document[:Name])
+
+    unless document[:MAC].nil?
+      message += ' '
+      sizes[:MAC].times do |i|
+        message += format(' %-17s', document[:MAC][i])
+      end
+    end
+
+    unless document[:IPv6].nil?
+      message += ' '
+      sizes[:IPv6].times do |i|
+        message += format(' %-39s', document[:IPv6][i])
+      end
+    end
+
+    unless document[:IPv4].nil?
+      message += ' '
+      sizes[:IPv4].times do |i|
+        message += format(' %-15s', document[:IPv4][i])
+      end
+    end
+
+    puts message
+  end
+end
+
+def list(collection)
+  documents = collection.find(nil, { sort: { Name: 1 } })
+
+  print_documents(documents)
+end
+
+def search(collection, *a)
+  a.each do |s|
+    filter = if mac_address?(s)
+               { MAC: s }
+             elsif s =~ Resolv::IPv6::Regex
+               { IPv6: s }
+             elsif s =~ Resolv::IPv4::Regex
+               { IPv4: s }
+             else
+               { Name: s }
+             end
+
+    documents = collection.find(filter, { sort: { Name: 1 } })
+
+    print_documents(documents)
+  end
+end
+
+def add(collection, name, *a)
+  mac  = []
+  ipv6 = []
+  ipv4 = []
+  a.each do |s|
+    if mac_address?(s)
+      mac.push(s)
+    elsif s =~ Resolv::IPv6::Regex
+      ipv6.push(s)
+    elsif s =~ Resolv::IPv4::Regex
+      ipv4.push(s)
+    end
+  end
+
+  document = { Name: name }
+  document.store(:MAC, mac) unless mac.empty?
+  document.store(:IPv6, ipv6) unless ipv6.empty?
+  document.store(:IPv4, ipv4) unless ipv4.empty?
+
+  collection.insert_one(document)
+end
+
+def delete(collection, *a)
+  a.each do |s|
+    filter = if mac_address?(s)
+               { MAC: s }
+             elsif s =~ Resolv::IPv6::Regex
+               { IPv6: s }
+             elsif s =~ Resolv::IPv4::Regex
+               { IPv4: s }
+             else
+               { Name: s }
+             end
+
+    collection.delete_many(filter)
+  end
+end
+
+opts = ARGV.getopts('h:P:u:p:d:c:')
+host = opts['h'] || 'localhost'
+port = opts['P'] || '27017'
+user = opts['u']
+pass = opts['p']
+db   = opts['d']
+col  = opts['c']
+
+uri = if user.nil? or pass.nil?
+        format('mongodb://%s:%s/%s', host, port, db)
+      else
+        format('mongodb://%s:%s@%s:%s/%s', user, pass, host, port, db)
+      end
+
+Mongo::Logger.logger = Logger.new(STDERR)
+Mongo::Logger.level  = Logger::INFO
+
+client     = Mongo::Client.new(uri)
+collection = client[col]
+
+command = ARGV.shift
+case command
+when nil, 'l', 'list'
+  list(collection)
+when 's', 'search'
+  search(collection, *ARGV)
+when 'a', 'add'
+  name = ARGV.shift
+  add(collection, name, *ARGV)
+when 'd', 'delete'
+  delete(collection, *ARGV)
+else
+  ARGV.unshift(command)
+  search(collection, *ARGV)
+end
+
+client.close
